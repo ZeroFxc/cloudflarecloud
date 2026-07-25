@@ -575,7 +575,8 @@ curl -X POST https://file-text-store.difierline.workers.dev/api/run \
     <h3>存储说明</h3>
     <ul>
       <li>使用 Cloudflare Workers KV 存储，数据最终一致性</li>
-      <li>单文件最大 25MB（KV 限制）</li>
+      <li>单文件最大 25MB（KV 单条目限制），超过 25MB 自动分片存储，最大支持 1GB</li>
+      <li>大文件（>5MB）自动分片上传，分片下载时自动拼接</li>
       <li>免费额度：每天 10 万次读取 + 1000 次写入/删除</li>
       <li>密码使用 SHA-256 哈希存储，不保存明文</li>
     </ul>
@@ -690,6 +691,24 @@ let currentDir='',allEntries=[],pendingFiles=null,editingKey=null,pwdResolve=nul
 function toast(m,t){const e=document.createElement('div');e.className='toast '+t;e.textContent=m;document.getElementById('toastContainer').appendChild(e);setTimeout(()=>e.remove(),2800)}
 function formatSize(b){if(!b)return'';if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';return(b/1048576).toFixed(1)+' MB'}
 
+/** 分片上传大文件（>5MB），支持进度回调 */
+async function uploadFileChunked(file,dir,password,progressBar,progressText,bytesDone,totalBytes){
+  const initRes=await fetch('/api/upload/chunk/init',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileName:file.name,fileSize:file.size,dir,password})});
+  const initData=await initRes.json();if(initData.error)throw new Error(initData.error);
+  const uploadId=initData.uploadId,chunkSize=initData.chunkSize,totalChunks=initData.totalChunks;
+  for(let i=0;i<totalChunks;i++){
+    const start=i*chunkSize,end=Math.min(start+chunkSize,file.size);
+    const chunk=file.slice(start,end);
+    const chunkRes=await fetch('/api/upload/chunk/'+uploadId,{method:'POST',headers:{'X-Chunk-Index':String(i)},body:chunk});
+    const chunkData=await chunkRes.json();if(chunkData.error)throw new Error(chunkData.error);
+    const pct=Math.round((bytesDone+end)/totalBytes*100);
+    progressBar.style.width=pct+'%';progressText.textContent=file.name+' 分片 '+(i+1)+'/'+totalChunks;
+  }
+  const finalRes=await fetch('/api/upload/chunk/'+uploadId+'/finalize',{method:'POST'});
+  const finalData=await finalRes.json();if(finalData.error)throw new Error(finalData.error);
+  return finalData;
+}
+
 // ========== 页面切换 ==========
 document.querySelectorAll('[data-page]').forEach(a=>{a.addEventListener('click',()=>{document.querySelectorAll('[data-page]').forEach(x=>x.classList.remove('active'));a.classList.add('active');document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));document.getElementById('page'+a.dataset.page.charAt(0).toUpperCase()+a.dataset.page.slice(1)).classList.add('active');if(a.dataset.page==='scripts')loadScripts();if(a.dataset.page==='apikeys')loadApiKeys();if(a.dataset.page==='files')loadEntries();if(a.dataset.page==='admin')loadAdminData()})});
 
@@ -715,10 +734,10 @@ function renderEntries(){
   if(filtered.length===0){el.innerHTML='<div class="empty-state">'+(q?'无匹配':'目录为空')+'</div>';return}
   el.innerHTML=filtered.map(e=>{
     if(e.type==='dir')return '<div class="file-item dir" data-dir="'+(currentDir?currentDir+'/':'')+e.name+'"><div class="file-icon" style="color:var(--warning)">📁</div><div class="file-info"><div class="file-name">'+e.name+'/</div></div></div>';
-    const isText=e.metadata?.isText!==false,isImg=e.metadata?.isImage===true,hasPwd=e.metadata?.hasPassword===true;
+    const isText=e.metadata?.isText!==false,isImg=e.metadata?.isImage===true,hasPwd=e.metadata?.hasPassword===true,isChunked=e.metadata?.chunked===true;
     const size=e.metadata?.size||0,sizeClass=size<102400?'size-sm':size<1048576?'size-md':'size-lg';
     const ext=e.name.includes('.')?e.name.split('.').pop().toUpperCase():'?';
-    return '<div class="file-item"><div class="file-icon">'+(isImg?'🖼':ext.substring(0,3))+'</div><div class="file-info"><div class="file-name"><a data-action="preview" data-key="'+e.key+'" data-img="'+isImg+'" data-text="'+isText+'">'+e.name+'</a>'+(hasPwd?' <span class="lock-icon">🔒</span>':'')+'</div><div class="file-meta"><span class="'+sizeClass+'">'+formatSize(e.metadata?.size)+'</span><span>'+ (e.metadata?.contentType||'')+'</span></div></div><div class="file-actions">'+(isText?'<button class="btn btn-sm" data-action="edit" data-key="'+e.key+'">编辑</button>':'')+'<button class="btn btn-sm" data-action="download" data-key="'+e.key+'" data-pwd="'+hasPwd+'">下载</button><button class="btn btn-sm btn-danger" data-action="delete" data-key="'+e.key+'">删除</button></div></div>';
+    return '<div class="file-item"><div class="file-icon">'+(isImg?'🖼':ext.substring(0,3))+'</div><div class="file-info"><div class="file-name"><a data-action="preview" data-key="'+e.key+'" data-img="'+isImg+'" data-text="'+isText+'">'+e.name+'</a>'+(hasPwd?' <span class="lock-icon">🔒</span>':'')+(isChunked?' <span style="color:var(--accent);font-size:0.7rem">分片</span>':'')+'</div><div class="file-meta"><span class="'+sizeClass+'">'+formatSize(e.metadata?.size)+'</span><span>'+ (e.metadata?.contentType||'')+'</span></div></div><div class="file-actions">'+(isText&&!isChunked?'<button class="btn btn-sm" data-action="edit" data-key="'+e.key+'">编辑</button>':'')+'<button class="btn btn-sm" data-action="download" data-key="'+e.key+'" data-pwd="'+hasPwd+'">下载</button><button class="btn btn-sm btn-danger" data-action="delete" data-key="'+e.key+'">删除</button></div></div>';
   }).join('');
 }
 // 事件委托：统一在 fileList 容器上处理所有点击
@@ -754,15 +773,21 @@ document.getElementById('uploadDialogConfirm').addEventListener('click',async()=
 
   for(const f of pendingFiles){
     try{
-      const fd=new FormData();fd.append('file',f);if(dir)fd.append('dir',dir);if(password)fd.append('password',password);
-      await new Promise((resolve,reject)=>{
-        const xhr=new XMLHttpRequest();
-        xhr.open('POST','/api/upload');
-        xhr.upload.onprogress=(e)=>{if(e.lengthComputable){const fileDone=uploadedBytes+e.loaded;const pct=Math.round(fileDone/totalBytes*100);progressBar.style.width=pct+'%';progressText.textContent=f.name+' ('+Math.round(e.loaded/e.total*100)+'%)'}};
-        xhr.onload=()=>{try{const d=JSON.parse(xhr.responseText);if(d.error)reject(new Error(d.error));else{uploadedBytes+=f.size;done++;progressBar.style.width=Math.round(uploadedBytes/totalBytes*100)+'%';progressText.textContent='已完成 '+done+'/'+total;resolve()}}catch(e){reject(e)}};
-        xhr.onerror=()=>reject(new Error('网络错误'));
-        xhr.send(fd);
-      });
+      if(f.size > 5*1024*1024){
+        await uploadFileChunked(f,dir,password,progressBar,progressText,uploadedBytes,totalBytes);
+        uploadedBytes+=f.size;done++;
+        progressBar.style.width=Math.round(uploadedBytes/totalBytes*100)+'%';progressText.textContent='已完成 '+done+'/'+total;
+      }else{
+        const fd=new FormData();fd.append('file',f);if(dir)fd.append('dir',dir);if(password)fd.append('password',password);
+        await new Promise((resolve,reject)=>{
+          const xhr=new XMLHttpRequest();
+          xhr.open('POST','/api/upload');
+          xhr.upload.onprogress=(e)=>{if(e.lengthComputable){const fileDone=uploadedBytes+e.loaded;const pct=Math.round(fileDone/totalBytes*100);progressBar.style.width=pct+'%';progressText.textContent=f.name+' ('+Math.round(e.loaded/e.total*100)+'%)'}};
+          xhr.onload=()=>{try{const d=JSON.parse(xhr.responseText);if(d.error)reject(new Error(d.error));else{uploadedBytes+=f.size;done++;progressBar.style.width=Math.round(uploadedBytes/totalBytes*100)+'%';progressText.textContent='已完成 '+done+'/'+total;resolve()}}catch(e){reject(e)}};
+          xhr.onerror=()=>reject(new Error('网络错误'));
+          xhr.send(fd);
+        });
+      }
     }catch(e){toast('上传失败: '+e.message,'error');progressWrap.classList.add('hidden');return}
   }
   toast('全部上传成功 ('+done+' 个文件)','success');
@@ -1033,14 +1058,32 @@ uploadBtn.addEventListener('click',async()=>{
   if(!apiKey){showStatus('请输入 API Key','error');return}
   if(!pendingFiles||pendingFiles.length===0){showStatus('请选择文件','error');return}
   uploadBtn.disabled=true;progress.classList.remove('hidden');
-  let done=0;
+  let done=0,total=pendingFiles.length,totalBytes=0;
+  for(const f of pendingFiles) totalBytes+=f.size;
   for(const file of pendingFiles){
     try{
-      const fd=new FormData();fd.append('file',file);if(dir)fd.append('dir',dir);
-      const r=await fetch('/api/upload',{method:'POST',headers:{'Authorization':'Bearer '+apiKey},body:fd});
-      const d=await r.json();
-      if(d.error)throw new Error(d.error);
-      done++;progressBar.style.width=(done/pendingFiles.length*100)+'%';
+      if(file.size > 5*1024*1024){
+        // 大文件：分片上传
+        const initRes=await fetch('/api/upload/chunk/init',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+apiKey},body:JSON.stringify({fileName:file.name,fileSize:file.size,dir})});
+        const initData=await initRes.json();if(initData.error)throw new Error(initData.error);
+        const uploadId=initData.uploadId,chunkSize=initData.chunkSize,totalChunks=initData.totalChunks;
+        for(let i=0;i<totalChunks;i++){
+          const start=i*chunkSize,end=Math.min(start+chunkSize,file.size);
+          const chunk=file.slice(start,end);
+          const chunkRes=await fetch('/api/upload/chunk/'+uploadId,{method:'POST',headers:{'X-Chunk-Index':String(i),'Authorization':'Bearer '+apiKey},body:chunk});
+          const chunkData=await chunkRes.json();if(chunkData.error)throw new Error(chunkData.error);
+          showStatus(file.name+' 分片 '+(i+1)+'/'+totalChunks,'');
+        }
+        const finalRes=await fetch('/api/upload/chunk/'+uploadId+'/finalize',{method:'POST',headers:{'Authorization':'Bearer '+apiKey}});
+        const finalData=await finalRes.json();if(finalData.error)throw new Error(finalData.error);
+        done++;progressBar.style.width=(done/total*100)+'%';
+      }else{
+        const fd=new FormData();fd.append('file',file);if(dir)fd.append('dir',dir);
+        const r=await fetch('/api/upload',{method:'POST',headers:{'Authorization':'Bearer '+apiKey},body:fd});
+        const d=await r.json();
+        if(d.error)throw new Error(d.error);
+        done++;progressBar.style.width=(done/total*100)+'%';
+      }
     }catch(e){showStatus(file.name+': '+e.message,'error');uploadBtn.disabled=false;return}
   }
   showStatus('全部上传成功 ('+done+' 个文件)','success');pendingFiles=null;fileList.classList.add('hidden');uploadBtn.disabled=true;progress.classList.add('hidden');progressBar.style.width='0%';
@@ -1147,6 +1190,22 @@ export default {
       if (method === 'POST' && pathname === '/api/mkdir') {
         if (!checkPerm(user, 'files:write')) return json({ error: '无此权限' }, 403, cors);
         return handleMkdir(user.userId, request, env, cors);
+      }
+
+      // ====== 分片上传 API ======
+      if (method === 'POST' && pathname === '/api/upload/chunk/init') {
+        if (!checkPerm(user, 'files:write')) return json({ error: '无此权限' }, 403, cors);
+        return handleChunkInit(user.userId, request, env, cors);
+      }
+      const chunkUploadMatch = pathname.match(/^\/api\/upload\/chunk\/([^\/]+)$/);
+      if (chunkUploadMatch && method === 'POST') {
+        if (!checkPerm(user, 'files:write')) return json({ error: '无此权限' }, 403, cors);
+        return handleChunkReceive(user.userId, chunkUploadMatch[1], request, env, cors);
+      }
+      const chunkFinalizeMatch = pathname.match(/^\/api\/upload\/chunk\/([^\/]+)\/finalize$/);
+      if (chunkFinalizeMatch && method === 'POST') {
+        if (!checkPerm(user, 'files:write')) return json({ error: '无此权限' }, 403, cors);
+        return handleChunkFinalize(user.userId, chunkFinalizeMatch[1], request, env, cors);
       }
 
       const route = parseRoute(pathname);
@@ -1356,22 +1415,72 @@ async function handleDownload(key, password, env, cors) {
   const { value, metadata } = await env.FILE_STORE.getWithMetadata(key, 'arrayBuffer');
   if (!value) return json({ error: '文件不存在' }, 404, cors);
 
+  // 检查密码
   if (metadata?.passwordHash) {
     if (!password) return json({ error: '需要密码', needPassword: true }, 401, cors);
     if (await sha256(password) !== metadata.passwordHash) return json({ error: '密码错误' }, 403, cors);
   }
 
-  const base64 = new TextDecoder().decode(value);
-  const bytes = base64ToBytes(base64);
+  let fileBytes;
+  if (metadata?.chunked) {
+    // 分片文件：逐个读取分片并拼接
+    const chunks = [];
+    let totalSize = 0;
+    for (let i = 0; i < metadata.totalChunks; i++) {
+      const chunkB64 = await env.FILE_STORE.get(key + '/chunk/' + i);
+      if (!chunkB64) return json({ error: '文件分片 ' + i + ' 丢失' }, 500, cors);
+      const bytes = base64ToBytes(chunkB64);
+      totalSize += bytes.byteLength;
+      chunks.push(bytes);
+    }
+    const combined = new Uint8Array(totalSize);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    fileBytes = combined;
+  } else {
+    // 单文件存储：Base64 解码
+    const base64 = new TextDecoder().decode(value);
+    fileBytes = base64ToBytes(base64);
+  }
+
   const filename = metadata?.originalName || key.split('/').pop() || key;
-  return new Response(bytes, { headers: { 'Content-Type': metadata?.contentType || 'application/octet-stream', 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`, 'Content-Length': bytes.byteLength.toString(), ...cors } });
+  return new Response(fileBytes, {
+    headers: {
+      'Content-Type': metadata?.contentType || 'application/octet-stream',
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      'Content-Length': fileBytes.byteLength.toString(),
+      ...cors
+    }
+  });
 }
 
 async function handleGetFile(key, env, cors) {
   const { value, metadata } = await env.FILE_STORE.getWithMetadata(key, 'arrayBuffer');
   if (!value) return json({ error: '文件不存在' }, 404, cors);
   const result = { key, metadata: metadata || {} };
-  if (metadata?.isText) result.content = base64ToText(new TextDecoder().decode(value));
+  if (metadata?.chunked) {
+    // 分片文件：拼接后返回文本内容（仅文本文件）
+    if (metadata.isText) {
+      const chunks = [];
+      let totalSize = 0;
+      for (let i = 0; i < metadata.totalChunks; i++) {
+        const chunkB64 = await env.FILE_STORE.get(key + '/chunk/' + i);
+        if (!chunkB64) return json({ error: '文件分片丢失' }, 500, cors);
+        const bytes = base64ToBytes(chunkB64);
+        totalSize += bytes.byteLength;
+        chunks.push(bytes);
+      }
+      const combined = new Uint8Array(totalSize);
+      let offset = 0;
+      for (const chunk of chunks) { combined.set(chunk, offset); offset += chunk.byteLength; }
+      result.content = new TextDecoder().decode(combined);
+    }
+  } else if (metadata?.isText) {
+    result.content = base64ToText(new TextDecoder().decode(value));
+  }
   return json(result, 200, cors);
 }
 
@@ -1390,8 +1499,123 @@ async function handleUpdate(key, request, env, cors) {
 }
 
 async function handleDelete(key, env, cors) {
+  const { metadata } = await env.FILE_STORE.getWithMetadata(key, 'arrayBuffer');
+  // 分片文件需清理所有分片
+  if (metadata?.chunked) {
+    for (let i = 0; i < metadata.totalChunks; i++) {
+      await env.FILE_STORE.delete(key + '/chunk/' + i);
+    }
+  }
   await env.FILE_STORE.delete(key);
   return json({ deleted: true }, 200, cors);
+}
+
+// ==================== 分片上传处理 ====================
+
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB 每片
+
+/** 分片上传 — 初始化上传会话 */
+async function handleChunkInit(userId, request, env, cors) {
+  let body; try { body = await request.json(); } catch { return json({ error: '无效 JSON' }, 400, cors); }
+  const { fileName, fileSize, dir, password } = body;
+  if (!fileName || !fileSize) return json({ error: '缺少 fileName 或 fileSize' }, 400, cors);
+  if (fileSize > 1024 * 1024 * 1024) return json({ error: '文件超过 1GB 限制' }, 400, cors);
+
+  const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+  const uploadId = 'up_' + randomToken().substring(0, 16);
+
+  await env.FILE_STORE.put('upload:' + uploadId, JSON.stringify({
+    userId, fileName, fileSize, dir: dir || '', password: password || '',
+    totalChunks, chunkSize: CHUNK_SIZE, received: 0,
+    createdAt: Date.now()
+  }), { expirationTtl: 3600 });
+
+  return json({ uploadId, chunkSize: CHUNK_SIZE, totalChunks }, 200, cors);
+}
+
+/** 分片上传 — 接收单个分片 */
+async function handleChunkReceive(userId, uploadId, request, env, cors) {
+  const session = await env.FILE_STORE.get('upload:' + uploadId, 'json');
+  if (!session || session.userId !== userId) return json({ error: '上传会话不存在或已过期' }, 404, cors);
+
+  const chunkIndex = parseInt(request.headers.get('X-Chunk-Index') || '-1');
+  if (chunkIndex < 0 || chunkIndex >= session.totalChunks) return json({ error: '分片索引无效' }, 400, cors);
+
+  const buffer = await request.arrayBuffer();
+  if (buffer.byteLength === 0) return json({ error: '分片数据为空' }, 400, cors);
+
+  const base64 = arrayBufferToBase64(buffer);
+  await env.FILE_STORE.put('chunk:' + uploadId + ':' + chunkIndex, base64, { expirationTtl: 3600 });
+
+  session.received++;
+  await env.FILE_STORE.put('upload:' + uploadId, JSON.stringify(session), { expirationTtl: 3600 });
+
+  return json({ chunkIndex, received: true, progress: session.received + '/' + session.totalChunks }, 200, cors);
+}
+
+/** 分片上传 — 完成上传，组装文件 */
+async function handleChunkFinalize(userId, uploadId, request, env, cors) {
+  const session = await env.FILE_STORE.get('upload:' + uploadId, 'json');
+  if (!session || session.userId !== userId) return json({ error: '上传会话不存在或已过期' }, 404, cors);
+
+  const totalChunks = session.totalChunks;
+  const chunkBuffers = [];
+  let totalSize = 0;
+
+  for (let i = 0; i < totalChunks; i++) {
+    const chunkB64 = await env.FILE_STORE.get('chunk:' + uploadId + ':' + i);
+    if (!chunkB64) return json({ error: '分片 ' + i + ' 丢失，请重新上传' }, 500, cors);
+    const bytes = base64ToBytes(chunkB64);
+    totalSize += bytes.byteLength;
+    chunkBuffers.push(bytes);
+  }
+
+  // 拼接所有分片
+  const combined = new Uint8Array(totalSize);
+  let offset = 0;
+  for (const chunk of chunkBuffers) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  const name = session.fileName;
+  const contentType = 'application/octet-stream';
+  const key = makeFileKey(userId, session.dir, name, Date.now());
+  const metadata = {
+    originalName: name, contentType, size: totalSize,
+    isText: isTextFile(name, contentType),
+    isImage: isImageFile(name, contentType),
+    uploadedAt: new Date().toISOString()
+  };
+  if (session.password) metadata.passwordHash = await sha256(session.password);
+
+  const KV_LIMIT = 25 * 1024 * 1024; // KV 单条目上限
+  if (totalSize > KV_LIMIT) {
+    // 超过 25MB：分片存储
+    metadata.chunked = true;
+    metadata.totalChunks = totalChunks;
+    metadata.chunkSize = CHUNK_SIZE;
+    // manifest 存 metadata，value 为占位
+    await env.FILE_STORE.put(key, 'CHUNKED', { metadata });
+    // 移动临时分片到永久存储
+    for (let i = 0; i < totalChunks; i++) {
+      const chunkB64 = await env.FILE_STORE.get('chunk:' + uploadId + ':' + i);
+      await env.FILE_STORE.put(key + '/chunk/' + i, chunkB64);
+      await env.FILE_STORE.delete('chunk:' + uploadId + ':' + i);
+    }
+  } else {
+    // 不超过 25MB：合并为单文件存储
+    const base64 = arrayBufferToBase64(combined.buffer);
+    await env.FILE_STORE.put(key, base64, { metadata });
+    // 清理临时分片
+    for (let i = 0; i < totalChunks; i++) {
+      await env.FILE_STORE.delete('chunk:' + uploadId + ':' + i);
+    }
+  }
+
+  await env.FILE_STORE.delete('upload:' + uploadId);
+
+  return json({ key, name, size: totalSize, chunked: totalSize > KV_LIMIT }, 200, cors);
 }
 
 // ==================== Admin 处理 ====================
@@ -1482,6 +1706,12 @@ async function handleAdminScripts(env, cors) {
 
 /** 管理员删除任意文件 */
 async function handleAdminDeleteFile(key, env, cors) {
+  const { metadata } = await env.FILE_STORE.getWithMetadata(key, 'arrayBuffer');
+  if (metadata?.chunked) {
+    for (let i = 0; i < metadata.totalChunks; i++) {
+      await env.FILE_STORE.delete(key + '/chunk/' + i);
+    }
+  }
   await env.FILE_STORE.delete(key);
   return json({ deleted: true }, 200, cors);
 }
