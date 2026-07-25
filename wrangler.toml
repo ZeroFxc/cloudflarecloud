@@ -1,0 +1,10 @@
+name = "file-text-store"
+main = "src/index.js"
+compatibility_date = "2025-07-25"
+
+kv_namespaces = [
+  { binding = "FILE_STORE", id = "6d03373e714d48c0a6f74167ec7b717d", preview_id = "01335c901e8f4ab7ae947c85a9474157" }
+]
+
+[observability]
+enabled = true

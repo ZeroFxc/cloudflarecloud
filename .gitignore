@@ -1,0 +1,5 @@
+node_modules/
+quickjs/
+.wrangler/
+*.log
+.DS_Store
